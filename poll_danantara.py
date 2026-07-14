@@ -123,38 +123,56 @@ async def proses_email(page, email, screenshot_number):
     except Exception as e:
         print(f"Peringatan: Gagal klik Selanjutnya otomatis ({str(e)}).")
         
-    print("5. Menunggu halaman Syarat & Ketentuan...")
+    print("5. Menangani halaman lanjutan (Syarat & Ketentuan / OTP)...")
     try:
-        # Menunggu sampai ada elemen baru yang menunjukkan halaman syarat dan ketentuan (teks syarat / setuju)
-        await page.wait_for_function(
-            '''() => document.body.innerText.toLowerCase().includes("syarat") || document.body.innerText.toLowerCase().includes("setuju")''', 
-            timeout=30000
-            
-        )
-        print("Halaman Syarat & Ketentuan terdeteksi.")
-        
-        print("Scroll ke bawah dan centang...")
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(500) # Jeda kecil agar trigger scroll terbaca
+        state = None
+        for _ in range(30):
+            body_text = (await page.locator('body').inner_text()).lower()
+            if any(keyword in body_text for keyword in ["periksa inbox", "masukkan kode", "kode verifikasi", "otp"]):
+                state = "otp"
+                break
+            if any(keyword in body_text for keyword in ["syarat", "ketentuan", "saya setuju", "setuju"]):
+                state = "terms"
+                break
 
-        # Mencari checkbox persetujuan syarat dan klik
-        # Terkadang checkbox tersembunyi dan harus diklik labelnya
-        label_syarat = page.locator('label').filter(has_text=re.compile(r"setuju", re.IGNORECASE))
-        if await label_syarat.count() > 0:
-            await label_syarat.first.click()
+            # dorong transisi kalau tombol next masih ada
+            try:
+                if await selanjutnya_btn.is_enabled():
+                    await selanjutnya_btn.click(timeout=1000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1000)
+
+        if state == "terms":
+            print("Halaman Syarat & Ketentuan terdeteksi.")
+            print("Scroll ke bawah dan centang...")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
+
+            label_syarat = page.locator('label').filter(has_text=re.compile(r"setuju|saya setuju|syarat|ketentuan", re.IGNORECASE))
+            if await label_syarat.count() > 0:
+                await label_syarat.first.click(force=True)
+            else:
+                checkboxes = await page.locator('input[type="checkbox"], div[role="checkbox"]').all()
+                for cb in checkboxes:
+                    try:
+                        await cb.click(force=True)
+                    except Exception:
+                        try:
+                            await cb.check(force=True)
+                        except Exception:
+                            pass
+
+            print("Mencoba klik Selanjutnya (Halaman Syarat)...")
+            selanjutnya_btn2 = page.locator('button').filter(has_text=re.compile(r"^Selanjutnya$|^Lanjut$|^Berikutnya$", re.IGNORECASE)).last
+            await selanjutnya_btn2.click(timeout=5000)
+            print("Berhasil klik Selanjutnya di halaman syarat.")
+        elif state == "otp":
+            print("Halaman OTP terdeteksi langsung; skip handling syarat.")
         else:
-            # Jika tidak ketemu teks 'setuju', cari semua checkbox di halaman dan centang
-            checkboxes = await page.locator('input[type="checkbox"]').all()
-            for cb in checkboxes:
-                await cb.check(force=True)
-
-        print("Mencoba klik Selanjutnya (Halaman Syarat)...")
-        # Karena kita sudah pindah halaman, cari lagi tombol Selanjutnya
-        selanjutnya_btn2 = page.locator('button').filter(has_text=re.compile(r"^Selanjutnya$", re.IGNORECASE)).last
-        await selanjutnya_btn2.click(timeout=5000)
-        print("Berhasil klik Selanjutnya di halaman syarat.")
+            print("Halaman syarat tidak terdeteksi jelas; lanjut cek OTP tanpa berhenti total.")
     except Exception as e:
-        print(f"Proses di halaman Syarat & Ketentuan gagal dieksekusi otomatis ({str(e)}). Silakan teruskan secara manual di browser.")
+        print(f"Handling halaman lanjutan tidak full otomatis ({str(e)}). Lanjut cek OTP...")
 
     print("6. Menunggu halaman verifikasi OTP (Periksa Inbox/Spam)...")
     try:
