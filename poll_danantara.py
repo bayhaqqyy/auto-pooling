@@ -7,21 +7,72 @@ import re
 import os
 import random
 
-async def click_captcha(page):
-    print("Mencoba klik Captcha Cloudflare Turnstile...")
-    try:
-        # Turnstile iframe biasanya ada di src yang mengandung 'challenges.cloudflare.com'
-        # Kita tunggu iframe-nya muncul
-        iframe = page.frame_locator('iframe[src*="cloudflare"], iframe[src*="turnstile"]').first
-        
-        # Di dalam iframe Turnstile, ada checkbox / area yang bisa diklik. 
-        # Kita tunggu checkbox/body nya clickable
-        await iframe.locator('body').click(timeout=15000, position={"x": 20, "y": 20})
-        print("Berhasil klik Captcha! (Tunggu proses validasi dari Cloudflare...)")
-    except Exception as e:
-        print(f"Peringatan: Gagal klik Captcha otomatis ({str(e)}). Jika ada Captcha yang belum tercentang, silakan klik manual.")
+SCREENSHOT_PREFIX = "rafli_14_07_2026_"
+SCREENSHOT_SUFFIX = ".png"
+EMAIL_PROCESS_TIMEOUT_SECONDS = 180
+MAX_RETRIES_PER_EMAIL = 2
 
-async def proses_email(page, email, idx):
+
+def get_screenshot_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bukti-polling")
+
+
+def get_next_screenshot_number(ss_dir=None):
+    ss_dir = ss_dir or get_screenshot_dir()
+    if not os.path.exists(ss_dir):
+        return 1
+
+    max_num = 0
+    for entry in os.listdir(ss_dir):
+        if not (entry.startswith(SCREENSHOT_PREFIX) and entry.endswith(SCREENSHOT_SUFFIX)):
+            continue
+        middle = entry[len(SCREENSHOT_PREFIX):-len(SCREENSHOT_SUFFIX)]
+        if middle.isdigit():
+            max_num = max(max_num, int(middle))
+    return max_num + 1
+
+
+def build_screenshot_path(next_number, ss_dir=None):
+    ss_dir = ss_dir or get_screenshot_dir()
+    return os.path.join(ss_dir, f"{SCREENSHOT_PREFIX}{next_number}{SCREENSHOT_SUFFIX}")
+
+
+def should_retry_status(status):
+    return status in {"failed", "timeout", "crashed"}
+
+async def click_captcha(page):
+    print("Mencoba deteksi Captcha Cloudflare Turnstile...")
+    candidate_selectors = [
+        '#cf-turnstile',
+        '[class*="turnstile"]',
+        'iframe[src*="cloudflare"]',
+        'iframe[src*="turnstile"]',
+    ]
+
+    for selector in candidate_selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() == 0:
+                continue
+            box = await locator.bounding_box()
+            if not box:
+                continue
+
+            click_x = box["x"] + min(30, max(10, box["width"] / 2))
+            click_y = box["y"] + min(30, max(10, box["height"] / 2))
+            await page.mouse.move(click_x, click_y)
+            await page.mouse.click(click_x, click_y)
+            await page.wait_for_timeout(3000)
+            print(f"Berhasil klik area Turnstile via selector: {selector}")
+            return True
+        except Exception as e:
+            print(f"Selector captcha gagal ({selector}): {e}")
+            continue
+
+    print("Peringatan: Turnstile tidak bisa diklik otomatis. Akan lanjut dan biarkan retry/self-heal menangani jika stuck.")
+    return False
+
+async def proses_email(page, email, screenshot_number):
     print(f"\n======================================")
     print(f"Memulai proses untuk email: {email}")
     print(f"======================================")
@@ -141,31 +192,10 @@ async def proses_email(page, email, idx):
 
     otp_kode = coba_auto_fetch()
 
-    # Fallback ke Manual Input jika Auto-OTP gagal/tidak dikonfigurasi
+    # Fallback: di server/tmux non-interactive, jangan masuk input() manual karena akan bikin self-heal macet.
     if not otp_kode:
-        print("\n⚠️ OTP tidak ditemukan otomatis. Jika belum terkirim, silakan klik tombol 'Masukkan Kode' secara manual di browser.")
-        while True:
-            otp_kode = input(f"\n[Email: {email}] Masukkan kode verifikasi (OTP)\n(Ketik 'baru' minta ulang, 'skip' lewati, atau TEKAN ENTER KOSONG untuk cek Gmail lagi): ")
-            
-            if otp_kode.strip().lower() == 'skip':
-                print("Melewati email ini dan lanjut ke berikutnya...")
-                return
-            elif otp_kode.strip().lower() == 'baru':
-                print("Meminta kode baru...")
-                minta_baru_btn = page.locator('button, a').filter(has_text=re.compile(r"minta kode baru|kirim ulang", re.IGNORECASE)).first
-                try:
-                    await minta_baru_btn.click()
-                except:
-                    pass
-                continue
-            elif otp_kode.strip() == "":
-                # User menekan enter kosong, coba fetch lagi!
-                hasil = coba_auto_fetch()
-                if hasil:
-                    otp_kode = hasil
-                    break
-            else:
-                break
+        print("\n⚠️ OTP tidak ditemukan otomatis. Email ini dianggap gagal agar self-heal bisa rerun tanpa input manual.")
+        return {"status": "failed", "screenshot_taken": False}
 
     print(f"Mengisi kode OTP: {otp_kode}")
     try:
@@ -242,7 +272,7 @@ async def proses_email(page, email, idx):
             await page.wait_for_timeout(500)
     except Exception as e:
         print("Error mencentang faktor. Gagal melanjutkan...", e)
-        return # STOP proses email ini supaya nggak salah screenshot
+        return {"status": "failed", "screenshot_taken": False}
 
     print("10. Memilih Institusi: Pegadaian...")
     try:
@@ -262,7 +292,7 @@ async def proses_email(page, email, idx):
             await page.wait_for_timeout(500)
     except Exception as e:
         print("Error memilih Pegadaian. Gagal melanjutkan...", e)
-        return # STOP proses email ini supaya nggak salah screenshot
+        return {"status": "failed", "screenshot_taken": False}
 
     print("11. Menunggu halaman Terima Kasih dan Screenshot...")
     try:
@@ -274,12 +304,12 @@ async def proses_email(page, email, idx):
         print(f"Halaman terima kasih lambat/tidak terdeteksi otomatis ({e}), tetap lanjut screenshot...")
 
     # Simpan screenshot menggunakan nomor urut
-    ss_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bukti-polling")
+    ss_dir = get_screenshot_dir()
     
     if not os.path.exists(ss_dir):
         os.makedirs(ss_dir)
         
-    ss_path = os.path.join(ss_dir, f"rafli_14_07_2026_{idx + 1}.png")
+    ss_path = build_screenshot_path(screenshot_number, ss_dir)
     await page.screenshot(path=ss_path, full_page=False) # Capture area yang terlihat saja (pop-up)
     print(f"✅ Screenshot berhasil disimpan: {ss_path}")
 
@@ -291,6 +321,48 @@ async def proses_email(page, email, idx):
             print("Berhasil menyelesaikan polling untuk email ini!")
     except:
         print("Tombol Simpan & Akhiri tidak ditemukan atau gagal diklik. Silakan periksa browser.")
+
+    return {"status": "success", "screenshot_taken": True, "screenshot_path": ss_path}
+
+
+async def create_page(context):
+    page = await context.new_page()
+    page.set_default_timeout(15000)
+    return page
+
+
+async def process_email_with_self_heal(context, email, screenshot_number):
+    last_status = "failed"
+    for attempt in range(1, MAX_RETRIES_PER_EMAIL + 1):
+        page = await create_page(context)
+        try:
+            print(f"\n🔁 Attempt {attempt}/{MAX_RETRIES_PER_EMAIL} untuk email: {email}")
+            result = await asyncio.wait_for(
+                proses_email(page, email, screenshot_number),
+                timeout=EMAIL_PROCESS_TIMEOUT_SECONDS,
+            )
+            status = (result or {}).get("status", "failed")
+            last_status = status
+            if status == "success":
+                await page.close()
+                return result
+            if not should_retry_status(status):
+                await page.close()
+                return result
+            print(f"⚠️ Status {status} untuk {email}. Menjalankan self-heal rerun...")
+        except asyncio.TimeoutError:
+            last_status = "timeout"
+            print(f"⏰ Timeout {EMAIL_PROCESS_TIMEOUT_SECONDS} detik untuk {email}. Self-heal rerun...")
+        except Exception as e:
+            last_status = "crashed"
+            print(f"💥 Error tidak terduga untuk {email}: {e}. Self-heal rerun...")
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    return {"status": last_status, "screenshot_taken": False}
 
 async def main():
     file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "email.txt")
@@ -312,26 +384,39 @@ async def main():
     print(f"Ditemukan {len(emails)} email untuk diproses.")
 
     async with async_playwright() as p:
-        print("\n🌐 Membuka browser Microsoft Edge...")
-        browser = await p.chromium.launch(
-            headless=False, 
-            channel="msedge",
-            args=["--start-maximized", "--incognito", "--disable-blink-features=AutomationControlled"]
-        )
+        edge_path = "/opt/microsoft/msedge/msedge"
+        has_display = bool(os.environ.get("DISPLAY"))
+        launch_kwargs = {
+            "headless": not has_display,
+            "args": ["--start-maximized", "--incognito", "--disable-blink-features=AutomationControlled"],
+        }
+        if has_display:
+            print("🖥️ DISPLAY terdeteksi. Menjalankan browser non-headless.")
+        else:
+            print("🕶️ DISPLAY tidak ada. Menjalankan browser headless untuk server mode.")
+        if os.path.exists(edge_path):
+            print("\n🌐 Membuka browser Microsoft Edge...")
+            launch_kwargs["channel"] = "msedge"
+        else:
+            print("\n🌐 Microsoft Edge tidak ditemukan. Fallback ke Chromium Playwright...")
+
+        browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(no_viewport=True)
-        page = await context.new_page()
-        # Biarkan lebih fleksibel kalau halamannya butuh waktu lama utk pindah/loading
-        page.set_default_timeout(15000) 
+
+        screenshot_counter = get_next_screenshot_number()
 
         for idx, email in enumerate(emails):
-            await proses_email(page, email, idx)
+            result = await process_email_with_self_heal(context, email, screenshot_counter)
+            if (result or {}).get("screenshot_taken"):
+                screenshot_counter += 1
             
             # Waktu jeda anti-spam jika bukan email terakhir
             if idx < len(emails) - 1:
                 jeda = random.randint(2, 5) # Dipercepat ekstrim
                 print(f"\n=> Selesai untuk email {email}.")
+                print(f"=> Status akhir: {(result or {}).get('status', 'unknown')}")
                 print(f"=> Menunggu {jeda} detik sebelum melanjutkan ke email berikutnya...")
-                await page.wait_for_timeout(jeda * 1000)
+                await asyncio.sleep(jeda)
 
         print("\n🎉 Semua email di dalam file email.txt telah diproses!")
         await browser.close()
