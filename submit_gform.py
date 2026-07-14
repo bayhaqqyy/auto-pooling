@@ -155,18 +155,30 @@ def screenshot_number(path):
 
 
 async def launch_browser(p, user_data_dir):
+    import platform
     has_display = bool(os.environ.get("DISPLAY"))
+    is_windows = platform.system().lower() == "windows"
+    
     launch_kwargs = {
-        "headless": not has_display,
+        "headless": False if is_windows else not has_display,
         "args": ["--start-maximized", "--disable-blink-features=AutomationControlled"],
         "no_viewport": True,
     }
-    if has_display:
+    if is_windows:
+        print("🖥️ Windows OS terdeteksi. Menjalankan browser non-headless.")
+    elif has_display:
         print("🖥️ DISPLAY terdeteksi. Menjalankan browser non-headless.")
     else:
         print("🕶️ DISPLAY tidak ada. Menjalankan browser headless.")
 
-    chrome_candidates = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+    if is_windows:
+        chrome_candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    else:
+        chrome_candidates = ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+        
     chrome_path = next((path for path in chrome_candidates if os.path.exists(path)), None)
     if chrome_path:
         print(f"🌐 Menggunakan browser system: {chrome_path}")
