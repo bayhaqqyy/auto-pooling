@@ -12,7 +12,6 @@ env/
 # Application specific data
 chrome_data/
 chrome_data_form/
-bukti-polling/
 
 # Credentials and config
 email.txt
