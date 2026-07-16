@@ -469,21 +469,34 @@ async def main():
     print(f"Ditemukan {len(emails)} email untuk diproses.")
 
     async with async_playwright() as p:
-        edge_path = "/opt/microsoft/msedge/msedge"
-        has_display = bool(os.environ.get("DISPLAY"))
+        is_windows = sys.platform.startswith("win")
+        
+        # Deteksi Path Edge di Windows atau Linux
+        if is_windows:
+            edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            # Di Windows, kita ingin browser terlihat agar tidak diblokir Turnstile
+            headless_mode = False 
+        else:
+            edge_path = "/opt/microsoft/msedge/msedge"
+            # Di Linux, jalankan headless jika tidak ada DISPLAY (mode server)
+            has_display = bool(os.environ.get("DISPLAY"))
+            headless_mode = not has_display
+
         launch_kwargs = {
-            "headless": not has_display,
+            "headless": headless_mode,
             "args": ["--start-maximized", "--incognito", "--disable-blink-features=AutomationControlled"],
         }
-        if has_display:
-            print("🖥️ DISPLAY terdeteksi. Menjalankan browser non-headless.")
+        
+        if headless_mode:
+            print("🕶️ Menjalankan browser HEADLESS (Tanpa Layar).")
         else:
-            print("🕶️ DISPLAY tidak ada. Menjalankan browser headless untuk server mode.")
+            print("🖥️ Menjalankan browser NON-HEADLESS (Browser Terbuka Visual).")
+            
         if os.path.exists(edge_path):
-            print("\n🌐 Membuka browser Microsoft Edge...")
+            print(f"\n🌐 Membuka browser Microsoft Edge dari: {edge_path}")
             launch_kwargs["channel"] = "msedge"
         else:
-            print("\n🌐 Microsoft Edge tidak ditemukan. Fallback ke Chromium Playwright...")
+            print("\n🌐 Microsoft Edge tidak ditemukan di path default. Fallback ke Chromium Playwright...")
 
         browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(no_viewport=True)
