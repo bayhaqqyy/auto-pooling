@@ -5,7 +5,7 @@ import os
 # ==========================================
 BASE_EMAIL = "rafliabdulbayhaqqy"
 DOMAIN_EMAIL = "@googlemail.com"
-MAX_EMAILS = 1000
+MAX_EMAILS = 10000
 
 def generate_dot_variants(base_username):
     variants = []

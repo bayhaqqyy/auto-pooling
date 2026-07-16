@@ -6,11 +6,34 @@ from playwright.async_api import async_playwright
 import re
 import os
 import random
+import json
+import datetime
 
-SCREENSHOT_PREFIX = "rafli_14_07_2026_"
+SCREENSHOT_PREFIX = f"rafli_{datetime.datetime.now().strftime('%d_%m_%Y')}_"
 SCREENSHOT_SUFFIX = ".png"
 EMAIL_PROCESS_TIMEOUT_SECONDS = 180
 MAX_RETRIES_PER_EMAIL = 2
+POLLING_SUCCESS_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "polling_success_emails.json")
+
+
+def load_success_emails():
+    if not os.path.exists(POLLING_SUCCESS_STATE_FILE):
+        return set()
+    try:
+        with open(POLLING_SUCCESS_STATE_FILE, "r") as f:
+            data = json.load(f)
+        return set(data.get("success_emails", []))
+    except Exception:
+        return set()
+
+
+def mark_success_email(email):
+    success_emails = load_success_emails()
+    success_emails.add(email)
+    tmp_path = POLLING_SUCCESS_STATE_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump({"success_emails": sorted(success_emails)}, f, indent=2)
+    os.replace(tmp_path, POLLING_SUCCESS_STATE_FILE)
 
 
 def get_screenshot_dir():
@@ -40,7 +63,23 @@ def build_screenshot_path(next_number, ss_dir=None):
 def should_retry_status(status):
     return status in {"failed", "timeout", "crashed"}
 
-async def click_captcha(page):
+async def wait_next_enabled(next_button, timeout_ms=15000):
+    deadline = asyncio.get_event_loop().time() + (timeout_ms / 1000)
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            if await next_button.count() > 0 and await next_button.is_visible() and await next_button.is_enabled():
+                return True
+        except Exception:
+            pass
+        await page_safe_sleep(250)
+    return False
+
+
+async def page_safe_sleep(ms):
+    await asyncio.sleep(ms / 1000)
+
+
+async def click_captcha(page, next_button=None):
     print("Mencoba deteksi Captcha Cloudflare Turnstile...")
     candidate_selectors = [
         '#cf-turnstile',
@@ -49,27 +88,38 @@ async def click_captcha(page):
         'iframe[src*="turnstile"]',
     ]
 
-    for selector in candidate_selectors:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count() == 0:
-                continue
-            box = await locator.bounding_box()
-            if not box:
+    for attempt in range(1, 4):
+        print(f"Percobaan captcha {attempt}/3...")
+        for selector in candidate_selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0:
+                    continue
+                box = await locator.bounding_box()
+                if not box:
+                    continue
+
+                click_x = box["x"] + min(30, max(10, box["width"] / 2))
+                click_y = box["y"] + min(30, max(10, box["height"] / 2))
+                await page.mouse.move(click_x, click_y)
+                await page.mouse.click(click_x, click_y)
+                print(f"Klik area Turnstile via selector: {selector}. Verifikasi tombol Selanjutnya...")
+
+                if next_button is not None:
+                    if await wait_next_enabled(next_button, timeout_ms=10000):
+                        print("✅ Captcha valid: tombol Selanjutnya sudah aktif.")
+                        return True
+                    print("⚠️ Captcha belum valid: tombol Selanjutnya masih disabled.")
+                else:
+                    await page.wait_for_timeout(3000)
+                    return True
+            except Exception as e:
+                print(f"Selector captcha gagal ({selector}): {e}")
                 continue
 
-            click_x = box["x"] + min(30, max(10, box["width"] / 2))
-            click_y = box["y"] + min(30, max(10, box["height"] / 2))
-            await page.mouse.move(click_x, click_y)
-            await page.mouse.click(click_x, click_y)
-            await page.wait_for_timeout(3000)
-            print(f"Berhasil klik area Turnstile via selector: {selector}")
-            return True
-        except Exception as e:
-            print(f"Selector captcha gagal ({selector}): {e}")
-            continue
+        await page.wait_for_timeout(1500)
 
-    print("Peringatan: Turnstile tidak bisa diklik otomatis. Akan lanjut dan biarkan retry/self-heal menangani jika stuck.")
+    print("❌ Captcha tidak terverifikasi setelah 3 percobaan. Email akan dianggap gagal agar self-heal rerun.")
     return False
 
 async def proses_email(page, email, screenshot_number):
@@ -106,22 +156,32 @@ async def proses_email(page, email, screenshot_number):
     except Exception as e:
         print(f"Gagal mencentang otomatis persetujuan ({str(e)}). Silakan centang manual jika belum tercentang.")
 
-    # Eksekusi Captcha
-    print("3. Mengelola Captcha...")
-    await click_captcha(page)
-
-    print("4. Mencoba klik Selanjutnya secara agresif...")
+    print("4. Mempersiapkan tombol Selanjutnya dan verifikasi Captcha...")
     selanjutnya_btn = page.locator('button').filter(has_text=re.compile(r"^Selanjutnya$", re.IGNORECASE)).first
+
+    # Eksekusi Captcha wajib valid: tombol Selanjutnya harus aktif dulu.
+    print("3. Mengelola Captcha...")
+    captcha_ok = await click_captcha(page, selanjutnya_btn)
+    if not captcha_ok:
+        print("❌ Captcha belum terceklis/valid. Stop email ini dan biarkan self-heal rerun.")
+        return {"status": "failed", "screenshot_taken": False}
+
+    print("4. Mencoba klik Selanjutnya setelah captcha valid...")
+    clicked_next = False
     try:
-        # Cek super cepat (tiap 0.2 detik) selama 15 detik (75 iterasi)
-        for _ in range(75): 
-            if await selanjutnya_btn.is_enabled():
+        for _ in range(75):
+            if await selanjutnya_btn.is_visible() and await selanjutnya_btn.is_enabled():
                 await selanjutnya_btn.click(timeout=1000)
-                print("Berhasil klik Selanjutnya secepat kilat!")
+                clicked_next = True
+                print("Berhasil klik Selanjutnya setelah captcha aktif!")
                 break
             await page.wait_for_timeout(200)
     except Exception as e:
         print(f"Peringatan: Gagal klik Selanjutnya otomatis ({str(e)}).")
+
+    if not clicked_next:
+        print("❌ Tombol Selanjutnya tidak aktif/berhasil diklik. Stop email ini dan rerun.")
+        return {"status": "failed", "screenshot_taken": False}
         
     print("5. Menangani halaman lanjutan (Syarat & Ketentuan / OTP)...")
     try:
@@ -255,6 +315,13 @@ async def proses_email(page, email, screenshot_number):
     try:
         multifinance = page.locator('text="Multifinance"').first
         await multifinance.wait_for(timeout=30000, state="visible")
+        
+        # Cek jika Multifinance terdeteksi limit / "tersedia lagi"
+        body_text_subsector = (await page.locator('body').inner_text()).lower()
+        if "tersedia lagi" in body_text_subsector:
+            print("⚠️ Terdeteksi limit sub-sektor (Tersedia lagi). Skip email ini.")
+            return {"status": "failed_limit_multifinance", "screenshot_taken": False}
+            
         await page.wait_for_timeout(500)
         await multifinance.click()
         print("Berhasil klik Multifinance.")
@@ -422,11 +489,18 @@ async def main():
         context = await browser.new_context(no_viewport=True)
 
         screenshot_counter = get_next_screenshot_number()
+        success_emails_set = load_success_emails()
 
         for idx, email in enumerate(emails):
+            if email in success_emails_set:
+                print(f"⏩ Email {email} sudah pernah sukses polling. Melewati...")
+                continue
+
             result = await process_email_with_self_heal(context, email, screenshot_counter)
             if (result or {}).get("screenshot_taken"):
                 screenshot_counter += 1
+                mark_success_email(email)
+                success_emails_set.add(email)
             
             # Waktu jeda anti-spam jika bukan email terakhir
             if idx < len(emails) - 1:

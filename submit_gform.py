@@ -192,6 +192,21 @@ async def launch_browser(p, user_data_dir):
 async def ensure_form_loaded(page):
     await page.goto(FORM_URL, wait_until="load", timeout=120000)
     await page.wait_for_timeout(3000)
+    
+    # Hapus draft/autosave Google Form lama agar response fresh
+    try:
+        clear_btns = page.locator('div[role="button"]:has-text("Clear form"), div[role="button"]:has-text("Kosongkan formulir")')
+        if await clear_btns.count() > 0:
+            print("🧹 Menghapus draft form lama agar form bersih...")
+            await clear_btns.first.click()
+            await page.wait_for_timeout(1000)
+            confirm = page.locator('div[role="button"]:has-text("Clear form"), div[role="button"]:has-text("Kosongkan formulir")').last
+            if await confirm.is_visible():
+                await confirm.click()
+                await page.wait_for_timeout(3000)
+                print("✨ Draft form berhasil dikosongkan.")
+    except Exception as e:
+        print(f"Peringatan: Gagal membersihkan draft form ({e})")
     if "accounts.google.com" in page.url:
         if not await login_google_if_needed(page):
             await page.screenshot(path="debug_google_login_required.png", full_page=True)
@@ -207,34 +222,113 @@ async def ensure_form_loaded(page):
     return True
 
 
-async def click_upload_and_set_files(page, files):
-    upload_buttons = page.locator(
-        'div[role="button"]:has-text("Add file"), '
-        'div[role="button"]:has-text("Tambahkan file"), '
-        'span:has-text("Add file"), '
-        'span:has-text("Tambahkan file")'
-    )
-    count = await upload_buttons.count()
-    if count == 0:
-        raise RuntimeError("Tombol Add file/Tambahkan file tidak ditemukan di form")
+async def click_upload_and_set_files(page, files, section_label=None):
+    """Upload file ke section Google Form yang tepat, dengan retry penuh.
+    Masalah Google Picker: kadang iframe lama tertinggal, Browse hidden, atau modal nyangkut.
+    Jadi setiap gagal: tutup modal, klik Add file ulang, lalu coba beberapa metode.
+    """
+    last_error = None
 
-    # 1. Klik Add File untuk buka Modal internal Google
-    await upload_buttons.first.click(force=True)
-    
-    # 2. Cari iframe modal picker yang muncul
-    print("      Menunggu modal Insert file terbuka...")
-    picker_iframe = page.frame_locator('iframe.picker-frame, iframe[src*="picker"]')
-    
-    # 3. Tunggu tombol Browse muncul di dalam iframe picker
-    browse_btn = picker_iframe.locator('text=/Browse|Jelajah|Pilih|Cari/i').first
-    await browse_btn.wait_for(state="visible", timeout=15000)
+    for attempt in range(1, 4):
+        print(f"      Upload attempt {attempt}/3")
+        try:
+            # Tutup modal picker sisa attempt/proses sebelumnya kalau ada
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
 
-    # 4. Klik Browse dan tangkap OS File Chooser
-    print("      Mengklik Browse dan menangkap file chooser...")
-    async with page.expect_file_chooser(timeout=30000) as fc:
-        await browse_btn.click(force=True)
-        
-    await (await fc.value).set_files(files)
+            # Cari container section target
+            container = None
+            if section_label:
+                print(f"🔍 Mencari container untuk section: {section_label}...")
+                container_locator = page.locator(f'div[role="listitem"]:has-text("{section_label}")').first
+                await container_locator.wait_for(timeout=15000)
+                await container_locator.scroll_into_view_if_needed()
+                await page.wait_for_timeout(800)
+                container = container_locator
+
+            upload_buttons = (container if container else page).locator(
+                'div[role="button"]:has-text("Add file"), '
+                'div[role="button"]:has-text("Add files"), '
+                'div[role="button"]:has-text("Tambahkan file"), '
+                'div[role="button"]:has-text("Tambah file"), '
+                'div[aria-label*="Add file"], '
+                'div[aria-label*="Tambahkan file"]'
+            )
+
+            target = None
+            count = await upload_buttons.count()
+            for idx in range(count):
+                candidate = upload_buttons.nth(idx)
+                try:
+                    if await candidate.is_visible():
+                        target = candidate
+                        break
+                except Exception:
+                    continue
+            if target is None:
+                raise RuntimeError(f"Tombol Add file/Tambahkan file tidak terlihat untuk {section_label}")
+
+            await target.scroll_into_view_if_needed()
+            await page.wait_for_timeout(300)
+            await target.click(force=True)
+            print("      Menunggu modal Insert file terbuka...")
+            picker_frames = page.locator('iframe.picker-frame, iframe[src*="picker"]')
+            await picker_frames.last.wait_for(state="attached", timeout=30000)
+            await page.wait_for_timeout(1500)
+
+            # Metode A: klik Browse via frame_locator terakhir (cara paling stabil kalau tombol visible)
+            try:
+                picker_iframe = page.frame_locator('iframe.picker-frame, iframe[src*="picker"]').last
+                browse_btn = picker_iframe.get_by_role("button", name=re.compile(r"Browse|Jelajah|Pilih|Cari|Pilih file", re.IGNORECASE)).first
+                await browse_btn.wait_for(state="visible", timeout=15000)
+                print("      Klik Browse via frame_locator...")
+                async with page.expect_file_chooser(timeout=20000) as fc:
+                    await browse_btn.click(force=True)
+                chooser = await fc.value
+                await chooser.set_files(files)
+                return
+            except Exception as e:
+                last_error = e
+                print(f"      Metode Browse gagal, coba direct input: {e}")
+
+            # Metode B: set langsung input[type=file] di frame picker terbaru
+            for frame in reversed(page.frames):
+                try:
+                    if "picker" not in (frame.url or ""):
+                        continue
+                    file_inputs = frame.locator('input[type="file"]')
+                    n = await file_inputs.count()
+                    for idx in range(n - 1, -1, -1):
+                        try:
+                            await file_inputs.nth(idx).set_input_files(files, timeout=15000)
+                            print("      Upload via direct input berhasil.")
+                            return
+                        except Exception as e:
+                            last_error = e
+                            continue
+                except Exception as e:
+                    last_error = e
+                    continue
+
+            raise RuntimeError(f"Semua metode upload gagal pada attempt {attempt}: {last_error}")
+        except Exception as e:
+            last_error = e
+            print(f"      ⚠️ Upload attempt {attempt} gagal: {e}")
+            try:
+                await page.screenshot(path=f"debug_upload_attempt_{attempt}.png")
+            except Exception:
+                pass
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(1200)
+            except Exception:
+                pass
+            continue
+
+    raise RuntimeError(f"Upload ke picker aktif gagal setelah 3 attempt: {last_error}")
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -284,7 +378,7 @@ async def main():
     print(f"📦 Ditemukan total {len(all_files)} screenshot di folder bukti-polling.")
     print(f"🆕 Yang belum pernah dikirim: {len(pending_files)} file.")
     
-    # Kelompokkan per 50 file (1 form submit max 50 file dibagi ke 5 tombol)
+    # Kelompokkan per 80 file: 1 form berisi 8 section (1-10 s/d 71-80), lalu submit sekali.
     batches = [pending_files[i:i + 50] for i in range(0, len(pending_files), 50)]
     
     user_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_data_form")
@@ -310,6 +404,8 @@ async def main():
             # Karena ini Chrome asli Anda, kemungkinan besar sudah login!
             # Namun kita tetap beri jeda sebentar untuk memastikan form termuat penuh
             await page.wait_for_timeout(3000)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(1000)
                 
             print("\n1. Mengisi Nama dan NIK...")
             # Perbaikan: Tambahkan :visible agar tidak error mengenai input tersembunyi (seperti captcha)
@@ -339,14 +435,18 @@ async def main():
             await date_input.fill(today)
             
             print("4. Mulai Mengupload Gambar...")
-            # Bagi lagi 50 gambar jadi 5 grup (karena 1 tombol "Add file" maksimal hanya bisa 10 gambar)
+            # 1 form = maksimal 5 slot upload, masing-masing 10 file: 1-10, 11-20, ... 41-50
             sub_batches = [batch_files[i:i + 10] for i in range(0, len(batch_files), 10)]
             
             for i, sub_batch in enumerate(sub_batches):
-                print(f"   -> Mengupload grup gambar ke-{i+1} ({len(sub_batch)} file)...")
+                print(f"   -> Mengupload batch slot ke-{i+1} ({len(sub_batch)} file)...")
                 await page.wait_for_timeout(1000)
                 try:
-                    await click_upload_and_set_files(page, sub_batch)
+                    start_num = i * 10 + 1
+                    end_num = start_num + 9
+                    section_label = f"Upload Evidence Polling {start_num}-{end_num}"
+                    print(f"      Fokus ke section: {section_label}")
+                    await click_upload_and_set_files(page, sub_batch, section_label=section_label)
                 except Exception as e:
                     print("❌ GAGAL MENGUPLOAD! Tidak bisa menemukan tombol Browse/Jelajahi.")
                     print(f"Detail error: {e}")
@@ -357,7 +457,6 @@ async def main():
                     return
                 
                 print("   -> Menunggu proses upload selesai (mohon bersabar)...")
-                # Popup upload otomatis tertutup jika upload beres (tunggu sampai elemennya hilang)
                 try:
                     await page.locator('div[role="dialog"]').wait_for(state="hidden", timeout=60000)
                 except:
@@ -366,7 +465,7 @@ async def main():
                     await page.locator('iframe.picker-frame, iframe[src*="picker"]').wait_for(state="hidden", timeout=60000)
                 except:
                     pass
-                print("   -> Upload grup selesai!")
+                print(f"   -> Slot {section_label} selesai!")
                 await page.wait_for_timeout(1000)
             
             print("\n5. Mencentang Persetujuan...")
@@ -375,15 +474,41 @@ async def main():
             
             print("6. Mengirim Form...")
             submit_btn = page.get_by_role("button", name=re.compile(r"Submit|Kirim", re.IGNORECASE))
-            await submit_btn.click()
+            await submit_btn.scroll_into_view_if_needed()
+            await submit_btn.click(no_wait_after=True)
             
             print("Menunggu konfirmasi...")
-            try:
-                # Cari salah satu dari teks sukses (Inggris/Indo)
-                await page.wait_for_selector('text="Your response has been recorded.", text="Tanggapan Anda telah direkam."', timeout=60000)
-                print(f"✅ Form ke-{batch_idx + 1} BERHASIL DIKIRIM!")
-            except:
-                print("⚠️ Tidak dapat mendeteksi halaman sukses, tapi form mungkin sudah terkirim.")
+            success = False
+            # Tunggu maksimal 5 menit setelah klik submit: URL berubah ke formResponse
+            # atau teks sukses muncul.
+            for _ in range(300):
+                try:
+                    if 'formResponse' in page.url:
+                        success = True
+                        print(f"✅ Form ke-{batch_idx + 1} BERHASIL DIKIRIM! (deteksi URL)")
+                        break
+                except Exception:
+                    pass
+                try:
+                    page_text = await page.locator("body").inner_text(timeout=2000)
+                except Exception:
+                    page_text = ""
+                if (
+                    "Your response has been recorded" in page_text
+                    or "Tanggapan Anda telah direkam" in page_text
+                    or "Submit another response" in page_text
+                    or "Kirim tanggapan lain" in page_text
+                ):
+                    success = True
+                    print(f"✅ Form ke-{batch_idx + 1} BERHASIL DIKIRIM! (deteksi halaman sukses)")
+                    break
+                await page.wait_for_timeout(1000)
+            if not success:
+                print("⚠️ Tidak dapat mendeteksi halaman sukses dalam 5 menit; ambil screenshot debug_submit_after_click.png")
+                try:
+                    await page.screenshot(path='debug_submit_after_click.png')
+                except Exception:
+                    pass
 
             mark_files_as_submitted(batch_files)
             print(f"📝 Menandai {len(batch_files)} file sebagai sudah terkirim di {SUBMITTED_STATE_FILE}")
